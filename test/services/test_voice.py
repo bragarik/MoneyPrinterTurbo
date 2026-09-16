@@ -1305,6 +1305,36 @@ class TestVoiceService(unittest.TestCase):
         self.assertIn("00:00:00,200 --> 00:00:01,100", subtitle_content)
         self.assertIn("Hello world", subtitle_content)
 
+    def test_create_subtitle_keeps_provider_cues_when_sentence_alignment_fails(self):
+        """Uma pequena normalização do TTS não deve remover todas as legendas."""
+        sub_maker = SimpleNamespace(
+            cues=[
+                SimpleNamespace(
+                    content="Primeira frase",
+                    start=timedelta(seconds=0),
+                    end=timedelta(seconds=1),
+                ),
+                SimpleNamespace(
+                    content="texto normalizado pelo TTS",
+                    start=timedelta(seconds=1),
+                    end=timedelta(seconds=2),
+                ),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle-fallback.srt"
+            vs.create_subtitle(
+                sub_maker=sub_maker,
+                text="Primeira frase. Segunda frase.",
+                subtitle_file=str(subtitle_file),
+            )
+            subtitle_content = subtitle_file.read_text(encoding="utf-8")
+
+        self.assertEqual(subtitle_content.count(" --> "), 2)
+        self.assertIn("Primeira frase", subtitle_content)
+        self.assertIn("texto normalizado pelo TTS", subtitle_content)
+
     def test_create_subtitle_ignores_markdown_underscore_marks(self):
         """
         `_` 常被用户用作 Markdown 强调标记，但 TTS 返回的 cue 通常不包含

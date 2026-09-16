@@ -2920,7 +2920,18 @@ def create_subtitle(
             logger.warning(
                 f"failed, sub_items len: {len(sub_items)}, script_lines len: {len(script_lines)}"
             )
-            return
+            # Alguns provedores normalizam uma palavra ou pontuação ao falar. Se a
+            # agregação por frases falhar, preservamos os tempos reais retornados
+            # pelo TTS em vez de descartar todas as legendas do vídeo.
+            if hasattr(sub_maker, "cues") and sub_maker.cues:
+                sub_items = _build_subtitle_items_from_edge_cues_words(sub_maker)
+            else:
+                sub_items = _build_subtitle_items_from_legacy_submaker_words(sub_maker)
+            if not sub_items:
+                return
+            logger.warning(
+                "sentence subtitle alignment failed; using provider cue timing"
+            )
 
         _write_subtitle_items(sub_items, subtitle_file)
     except Exception as e:

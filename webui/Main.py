@@ -46,6 +46,7 @@ from app.models.schema import (
 from app.services import bgm as bgm_service
 from app.services import (
     cache_manager,
+    file_cli_workspace,
     llm,
     loomloom,
     material,
@@ -251,6 +252,7 @@ PRESET_EXCLUDED_PARAM_KEYS = frozenset(
         "video_materials",
         "custom_audio_file",
         "bgm_file",
+        "file_cli_enabled",
     }
 )
 # 密钥按配置项名称后缀识别。新增 Provider 只要沿用现有命名，就会自动进入
@@ -735,6 +737,103 @@ def tr(key):
     # 新功能优先维护中英文。其它语言缺少单项翻译时统一回退英文，避免在多个
     # locale 中复制相同英文后长期失去同步；英文也没有该键时才显示原始 key。
     return locales.get("en", {}).get("Translation", {}).get(key, key)
+
+
+FILE_CLI_FIELD_WIDGETS = {
+    "tema.txt": "video_subject",
+    "roteiro.txt": "video_script",
+    "palavras_chave.txt": "video_terms",
+}
+
+
+def _save_file_cli_field(filename, widget_key):
+    # Só uma edição feita na WebUI grava o arquivo; reruns não sobrescrevem a IA.
+    if not config.app.get("file_cli_enabled", False):
+        return
+    value = st.session_state.get(widget_key, "")
+    try:
+        file_cli_workspace.write_field(filename, value)
+    except OSError as error:
+        logger.error(f"failed to save generic AI CLI field {filename}: {error}")
+        st.session_state["file_cli_field_error"] = str(error)
+    else:
+        # Marcamos o conteúdo como visto para não reaplicar nossa própria edição.
+        seen = st.session_state.setdefault("file_cli_seen_contents", {})
+        seen[filename] = str(value).strip()
+        st.session_state["file_cli_saved_field"] = filename
+        st.session_state.pop("file_cli_field_error", None)
+
+
+def _apply_pending_file_cli_fields():
+    pending = st.session_state.pop("pending_file_cli_fields", None)
+    if not pending or not config.app.get("file_cli_enabled", False):
+        return
+    # Este ponto roda antes de criar os widgets; Streamlit impede mudanças depois.
+    for filename, value in pending.items():
+        st.session_state[FILE_CLI_FIELD_WIDGETS[filename]] = value
+
+
+def _collect_file_cli_changes(contents):
+    seen = st.session_state.setdefault("file_cli_seen_contents", {})
+    changes = {}
+    for filename, content in contents.items():
+        previous = seen.get(filename)
+        if filename not in seen:
+            seen[filename] = content
+            if content is None:
+                continue
+        elif previous == content:
+            continue
+        else:
+            seen[filename] = content
+        widget_key = FILE_CLI_FIELD_WIDGETS[filename]
+        new_value = content or ""
+        if str(st.session_state.get(widget_key, "")).strip() != new_value:
+            changes[filename] = new_value
+    return changes
+
+
+def _sync_file_cli_fields_before_widgets():
+    if not config.app.get("file_cli_enabled", False):
+        return
+    try:
+        monitor = file_cli_workspace.get_monitor()
+    except OSError as error:
+        logger.error(f"failed to start generic AI CLI monitor: {error}")
+        return
+    # No carregamento inicial, preenchemos os campos antes de desenhá-los.
+    for filename, value in _collect_file_cli_changes(monitor.contents()).items():
+        st.session_state[FILE_CLI_FIELD_WIDGETS[filename]] = value
+
+
+@st.fragment(run_every="250ms")
+def _render_file_cli_monitor_status():
+    # O watchdog recebe mudanças na hora. Este fragment apenas repinta o status
+    # no Streamlit, que não oferece um rerun público disparado por outra thread.
+    workspace = file_cli_workspace.workspace_path()
+    try:
+        monitor = file_cli_workspace.get_monitor()
+    except OSError as error:
+        st.warning(tr("Generic AI CLI Folder Missing").format(path=error))
+        return
+
+    statuses = monitor.snapshot()
+    pending = _collect_file_cli_changes(monitor.contents())
+    if pending:
+        # O observer avisou; a próxima execução completa preencherá os widgets.
+        st.session_state["pending_file_cli_fields"] = pending
+        st.rerun(scope="app")
+    st.caption(tr("Generic AI CLI Monitoring").format(path=workspace))
+    field_statuses = []
+    for filename, label_key in (
+        ("tema.txt", "Video Subject"),
+        ("roteiro.txt", "Video Script"),
+        ("palavras_chave.txt", "Video Keywords"),
+    ):
+        ready = statuses.get(filename, False)
+        status = "✓" if ready else "…"
+        field_statuses.append(f"{tr(label_key)} {status}")
+    st.caption(" · ".join(field_statuses))
 
 
 # -----------------------------------------------------------------------------
@@ -1686,13 +1785,8 @@ def _render_top_bar():
             gap="small",
         )
 
-    with brand_col:
-        update_snapshot = version_checker.poll_available_update(config.project_version)
-        if update_snapshot.complete:
-            _render_brand(update_snapshot.available_version)
-        else:
-            _render_pending_version_check()
-
+    # Renderizamos as ações primeiro para que a checagem assíncrona de versão não
+    # possa reiniciar a primeira carga antes de o botão Ajustes existir na tela.
     with actions_col:
         with st.container(
             key="top_bar_actions",
@@ -1702,7 +1796,9 @@ def _render_top_bar():
             gap="small",
             width="stretch",
         ):
-            _render_task_manager_entry()
+            # O espaço mantém a ordem visual original, mas permite criar Ajustes
+            # antes da varredura inicial das tarefas, que pode demorar no primeiro uso.
+            task_manager_slot = st.empty()
 
             st.button(
                 tr("Settings"),
@@ -1743,6 +1839,16 @@ def _render_top_bar():
                     _save_runtime_config()
                     # 切换语言后强制刷新，避免 selectbox 继续展示旧语言文案。
                     st.rerun()
+
+            with task_manager_slot:
+                _render_task_manager_entry()
+
+    with brand_col:
+        update_snapshot = version_checker.poll_available_update(config.project_version)
+        if update_snapshot.complete:
+            _render_brand(update_snapshot.available_version)
+        else:
+            _render_pending_version_check()
 
 
 support_locales = [
@@ -2840,7 +2946,7 @@ def _parse_key_backup(raw_bytes, config_sections):
     return restored
 
 
-def _build_settings_preset_payload(params, app_version):
+def _build_settings_preset_payload(params, app_version, file_cli_enabled=False):
     """构造生成参数预设文件内容。"""
     preset_params = {
         key: value
@@ -2862,6 +2968,8 @@ def _build_settings_preset_payload(params, app_version):
         "schema": SETTINGS_PRESET_SCHEMA,
         "version": SETTINGS_PRESET_VERSION,
         "app_version": str(app_version),
+        # O modo da IA CLI é configuração da WebUI, não campo de VideoParams.
+        "file_cli_enabled": bool(file_cli_enabled),
         "params": preset_params,
     }
 
@@ -2894,7 +3002,14 @@ def _parse_settings_preset(raw_bytes):
         params_input["bgm_file"] = Path(builtin_bgm_path).name
     # video_subject 是 VideoParams 的必填字段，但预设允许只保存风格设置。
     params_input.setdefault("video_subject", "")
-    return VideoParams.model_validate(params_input).model_dump(mode="json")
+    validated_params = VideoParams.model_validate(params_input).model_dump(mode="json")
+    if "file_cli_enabled" in payload:
+        mode = payload["file_cli_enabled"]
+        if not isinstance(mode, bool):
+            raise ValueError("file_cli_enabled must be a boolean")
+        # Chave privada do preset; não será passada ao modelo de geração.
+        validated_params["_file_cli_enabled"] = mode
+    return validated_params
 
 
 def _apply_key_backup(restored_keys):
@@ -2919,6 +3034,15 @@ def _apply_pending_settings_preset():
     if not preset_params:
         return False
 
+    mode = preset_params.pop("_file_cli_enabled", None)
+    if mode is not None:
+        # Importar um preset restaura o checkbox antes de renderizar o widget.
+        if mode:
+            file_cli_workspace.ensure_workspace()
+        _set_runtime_config("app", "file_cli_enabled", mode)
+        st.session_state["file_cli_checkbox_nonce"] = (
+            st.session_state.get("file_cli_checkbox_nonce", 0) + 1
+        )
     _apply_restored_params(preset_params)
     logger.info("applied imported settings preset")
     return True
@@ -2929,7 +3053,9 @@ def _render_settings_transfer(params):
     with st.expander(tr("Settings Preset"), expanded=False):
         st.caption(tr("Settings Preset Help"))
         preset_payload = _build_settings_preset_payload(
-            params.model_dump(mode="json"), config.project_version
+            params.model_dump(mode="json"),
+            config.project_version,
+            file_cli_enabled=config.app.get("file_cli_enabled", False),
         )
         st.download_button(
             tr("Export Settings"),
@@ -3193,288 +3319,353 @@ def _render_settings_dialog():
         # 中间面板 - LLM 设置
 
         with middle_config_panel:
-            # 下拉顺序、默认 label 和稳定 provider id 全部来自 Registry；locale
-            # 只覆盖展示文案，不再让 Main.py 维护第二份 Provider 列表。
-            llm_provider_ids = [
-                provider.provider_id for provider in LLM_PROVIDER_REGISTRY
-            ]
-            llm_provider_labels = {
-                provider.provider_id: get_llm_provider_label(provider)
-                for provider in LLM_PROVIDER_REGISTRY
-            }
-            saved_llm_provider = config.app.get(
-                "llm_provider", DEFAULT_LLM_PROVIDER_ID
-            ).lower()
-            if saved_llm_provider not in llm_provider_ids:
-                saved_llm_provider = DEFAULT_LLM_PROVIDER_ID
-
-            llm_provider = stable_selectbox(
-                tr("LLM Provider"),
-                options=llm_provider_ids,
-                default_value=saved_llm_provider,
-                key="llm_provider_select",
-                format_func=lambda provider_id: llm_provider_labels[provider_id],
+            # A escolha fica persistida; a pasta só é criada depois da confirmação.
+            saved_file_cli_enabled = config.app.get("file_cli_enabled", False)
+            file_cli_checkbox_nonce = st.session_state.get("file_cli_checkbox_nonce", 0)
+            file_cli_enabled = st.checkbox(
+                tr("Use File-Based AI CLI"),
+                value=saved_file_cli_enabled,
+                help=tr("Use File-Based AI CLI Help"),
+                key=f"file_cli_enabled_checkbox_{file_cli_checkbox_nonce}",
             )
-            # 配置表单和 Provider 说明并排展示，减少长说明在窄列中的换行，
-            # 同时充分利用基础设置面板的横向空间。
-            llm_form_panel, llm_help_panel = st.columns(
-                [0.9, 1.1],
-                gap="large",
-                vertical_alignment="top",
-            )
-            llm_helper = llm_help_panel.container()
-            _set_runtime_config("app", "llm_provider", llm_provider)
-            llm_provider_spec = get_llm_provider(llm_provider)
-            if llm_provider_spec is None:
-                # 正常情况下下拉选项全部来自 Registry，不会进入该分支；保留
-                # 明确错误用于诊断损坏的 session state 或后续接入遗漏。
-                raise RuntimeError(f"unsupported llm provider: {llm_provider}")
-
-            llm_api_key = config.app.get(llm_provider_spec.config_key("api_key"), "")
-            configured_llm_base_url = config.app.get(
-                llm_provider_spec.config_key("base_url"), ""
-            )
-            llm_default_base_url = llm_provider_spec.effective_default_base_url
-            llm_base_url = configured_llm_base_url or llm_default_base_url
-            llm_model_name = llm_provider_spec.resolve_model_name(
-                config.app.get(llm_provider_spec.config_key("model_name"), "")
-            )
-
-            provider_tip_context = {}
-            selected_service_endpoint = None
-            if llm_provider_spec.service_endpoints:
-                # Kimi 等 Provider 的中国站和国际站使用不同账号体系。只让用户
-                # 选择服务区域，再由 Registry 同步 API 申请入口和 Base URL，
-                # 避免手工组合错误。已有空 Base URL 配置继续沿用中国站，只有
-                # 尚未填写 Key 的全新配置才根据界面语言推荐对应入口。
-                selected_service_endpoint = (
-                    llm_provider_spec.select_service_endpoint(
-                        configured_llm_base_url,
-                        has_api_key=bool(str(llm_api_key).strip()),
-                        prefer_international=(
-                            st.session_state.get("ui_language", "en") != "zh"
-                        ),
-                    )
-                )
-                endpoint_options = [
-                    endpoint.endpoint_id
-                    for endpoint in llm_provider_spec.service_endpoints
-                ] + [CUSTOM_LLM_ENDPOINT_ID]
-                default_endpoint_id = (
-                    selected_service_endpoint.endpoint_id
-                    if selected_service_endpoint
-                    else CUSTOM_LLM_ENDPOINT_ID
-                )
-                endpoint_labels = {
-                    endpoint.endpoint_id: (
-                        tr_optional(
-                            llm_provider_spec.endpoint_label_key(endpoint.endpoint_id),
-                            fallback_language="en",
+            if file_cli_enabled:
+                if not saved_file_cli_enabled:
+                    st.warning(tr("File-Based AI CLI Confirmation"))
+                    confirm_col, cancel_col = st.columns(2)
+                    if confirm_col.button(
+                        tr("Confirm File-Based AI CLI"),
+                        key="confirm_file_cli_button",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        try:
+                            # Aproveitamos campos já preenchidos antes de ativar o modo.
+                            file_cli_workspace.ensure_workspace()
+                            for filename, widget_key in FILE_CLI_FIELD_WIDGETS.items():
+                                current_value = str(
+                                    st.session_state.get(widget_key, "")
+                                ).strip()
+                                if current_value:
+                                    file_cli_workspace.write_field(
+                                        filename, current_value
+                                    )
+                        except OSError as error:
+                            st.error(
+                                tr("File-Based AI CLI Folder Failed").format(
+                                    error=error
+                                )
+                            )
+                            st.stop()
+                        _set_runtime_config("app", "file_cli_enabled", True)
+                        _save_runtime_config()
+                        st.rerun(scope="fragment")
+                    if cancel_col.button(
+                        tr("Cancel"),
+                        key="cancel_file_cli_button",
+                        use_container_width=True,
+                    ):
+                        st.session_state["file_cli_checkbox_nonce"] = (
+                            file_cli_checkbox_nonce + 1
                         )
-                        or endpoint.default_label
-                    )
-                    for endpoint in llm_provider_spec.service_endpoints
+                        st.rerun(scope="fragment")
+                else:
+                    try:
+                        workspace = file_cli_workspace.ensure_workspace()
+                    except OSError as error:
+                        st.error(
+                            tr("File-Based AI CLI Folder Failed").format(error=error)
+                        )
+                    else:
+                        st.success(
+                            tr("File-Based AI CLI Folder Ready").format(path=workspace)
+                        )
+                    st.info(tr("File-Based AI CLI Pending"))
+            elif saved_file_cli_enabled:
+                _set_runtime_config("app", "file_cli_enabled", False)
+
+            if not file_cli_enabled:
+                # 下拉顺序、默认 label 和稳定 provider id 全部来自 Registry；locale
+                # 只覆盖展示文案，不再让 Main.py 维护第二份 Provider 列表。
+                llm_provider_ids = [
+                    provider.provider_id for provider in LLM_PROVIDER_REGISTRY
+                ]
+                llm_provider_labels = {
+                    provider.provider_id: get_llm_provider_label(provider)
+                    for provider in LLM_PROVIDER_REGISTRY
                 }
-                endpoint_labels[CUSTOM_LLM_ENDPOINT_ID] = (
-                    tr_optional("Custom API Endpoint", fallback_language="en")
-                    or "Custom API Endpoint"
+                saved_llm_provider = config.app.get(
+                    "llm_provider", DEFAULT_LLM_PROVIDER_ID
+                ).lower()
+                if saved_llm_provider not in llm_provider_ids:
+                    saved_llm_provider = DEFAULT_LLM_PROVIDER_ID
+
+                llm_provider = stable_selectbox(
+                    tr("LLM Provider"),
+                    options=llm_provider_ids,
+                    default_value=saved_llm_provider,
+                    key="llm_provider_select",
+                    format_func=lambda provider_id: llm_provider_labels[provider_id],
                 )
-                with llm_form_panel:
-                    selected_endpoint_id = stable_selectbox(
-                        tr_optional(
-                            llm_provider_spec.endpoint_selector_label_key,
-                            fallback_language="en",
+                # 配置表单和 Provider 说明并排展示，减少长说明在窄列中的换行，
+                # 同时充分利用基础设置面板的横向空间。
+                llm_form_panel, llm_help_panel = st.columns(
+                    [0.9, 1.1],
+                    gap="large",
+                    vertical_alignment="top",
+                )
+                llm_helper = llm_help_panel.container()
+                _set_runtime_config("app", "llm_provider", llm_provider)
+                llm_provider_spec = get_llm_provider(llm_provider)
+                if llm_provider_spec is None:
+                    # 正常情况下下拉选项全部来自 Registry，不会进入该分支；保留
+                    # 明确错误用于诊断损坏的 session state 或后续接入遗漏。
+                    raise RuntimeError(f"unsupported llm provider: {llm_provider}")
+
+                llm_api_key = config.app.get(llm_provider_spec.config_key("api_key"), "")
+                configured_llm_base_url = config.app.get(
+                    llm_provider_spec.config_key("base_url"), ""
+                )
+                llm_default_base_url = llm_provider_spec.effective_default_base_url
+                llm_base_url = configured_llm_base_url or llm_default_base_url
+                llm_model_name = llm_provider_spec.resolve_model_name(
+                    config.app.get(llm_provider_spec.config_key("model_name"), "")
+                )
+
+                provider_tip_context = {}
+                selected_service_endpoint = None
+                if llm_provider_spec.service_endpoints:
+                    # Kimi 等 Provider 的中国站和国际站使用不同账号体系。只让用户
+                    # 选择服务区域，再由 Registry 同步 API 申请入口和 Base URL，
+                    # 避免手工组合错误。已有空 Base URL 配置继续沿用中国站，只有
+                    # 尚未填写 Key 的全新配置才根据界面语言推荐对应入口。
+                    selected_service_endpoint = (
+                        llm_provider_spec.select_service_endpoint(
+                            configured_llm_base_url,
+                            has_api_key=bool(str(llm_api_key).strip()),
+                            prefer_international=(
+                                st.session_state.get("ui_language", "en") != "zh"
+                            ),
                         )
-                        or tr("API Platform"),
-                        options=endpoint_options,
-                        default_value=default_endpoint_id,
-                        key=f"{llm_provider}_service_endpoint_select",
-                        format_func=lambda endpoint_id: endpoint_labels[endpoint_id],
-                        help=(
+                    )
+                    endpoint_options = [
+                        endpoint.endpoint_id
+                        for endpoint in llm_provider_spec.service_endpoints
+                    ] + [CUSTOM_LLM_ENDPOINT_ID]
+                    default_endpoint_id = (
+                        selected_service_endpoint.endpoint_id
+                        if selected_service_endpoint
+                        else CUSTOM_LLM_ENDPOINT_ID
+                    )
+                    endpoint_labels = {
+                        endpoint.endpoint_id: (
                             tr_optional(
-                                llm_provider_spec.endpoint_selector_help_key,
+                                llm_provider_spec.endpoint_label_key(endpoint.endpoint_id),
                                 fallback_language="en",
                             )
-                            or None
-                        ),
-                    )
-                selected_service_endpoint = next(
-                    (
-                        endpoint
+                            or endpoint.default_label
+                        )
                         for endpoint in llm_provider_spec.service_endpoints
-                        if endpoint.endpoint_id == selected_endpoint_id
-                    ),
-                    None,
-                )
-                if selected_service_endpoint:
-                    llm_base_url = selected_service_endpoint.base_url
-                    provider_tip_context.update(
-                        {
-                            "api_key_url": selected_service_endpoint.api_key_url,
-                            "default_base_url": selected_service_endpoint.base_url,
-                            "model_docs_url": selected_service_endpoint.model_docs_url,
-                        }
+                    }
+                    endpoint_labels[CUSTOM_LLM_ENDPOINT_ID] = (
+                        tr_optional("Custom API Endpoint", fallback_language="en")
+                        or "Custom API Endpoint"
                     )
-                else:
-                    # 自定义模式只保留用户明确保存的地址，不将某个标准区域伪装
-                    # 成自定义值。输入为空时配置不会持久化，下一次仍回到兼容默认。
-                    llm_base_url = str(configured_llm_base_url or "").strip()
-
-            if llm_provider == "ollama":
-                llm_default_base_url = config.get_default_ollama_base_url()
-                if not llm_base_url:
-                    llm_base_url = llm_default_base_url
-                docker_hint = ""
-                if config.is_running_in_container():
-                    docker_hint = tr_optional(
-                        "llm_provider_tips.ollama.docker_hint",
-                        fallback_language="en",
+                    with llm_form_panel:
+                        selected_endpoint_id = stable_selectbox(
+                            tr_optional(
+                                llm_provider_spec.endpoint_selector_label_key,
+                                fallback_language="en",
+                            )
+                            or tr("API Platform"),
+                            options=endpoint_options,
+                            default_value=default_endpoint_id,
+                            key=f"{llm_provider}_service_endpoint_select",
+                            format_func=lambda endpoint_id: endpoint_labels[endpoint_id],
+                            help=(
+                                tr_optional(
+                                    llm_provider_spec.endpoint_selector_help_key,
+                                    fallback_language="en",
+                                )
+                                or None
+                            ),
+                        )
+                    selected_service_endpoint = next(
+                        (
+                            endpoint
+                            for endpoint in llm_provider_spec.service_endpoints
+                            if endpoint.endpoint_id == selected_endpoint_id
+                        ),
+                        None,
                     )
-                provider_tip_context["docker_hint"] = docker_hint
+                    if selected_service_endpoint:
+                        llm_base_url = selected_service_endpoint.base_url
+                        provider_tip_context.update(
+                            {
+                                "api_key_url": selected_service_endpoint.api_key_url,
+                                "default_base_url": selected_service_endpoint.base_url,
+                                "model_docs_url": selected_service_endpoint.model_docs_url,
+                            }
+                        )
+                    else:
+                        # 自定义模式只保留用户明确保存的地址，不将某个标准区域伪装
+                        # 成自定义值。输入为空时配置不会持久化，下一次仍回到兼容默认。
+                        llm_base_url = str(configured_llm_base_url or "").strip()
 
-            tips = get_llm_provider_tips(llm_provider, **provider_tip_context)
-            if tips:
-                with llm_helper:
-                    st.info(tips)
+                if llm_provider == "ollama":
+                    llm_default_base_url = config.get_default_ollama_base_url()
+                    if not llm_base_url:
+                        llm_base_url = llm_default_base_url
+                    docker_hint = ""
+                    if config.is_running_in_container():
+                        docker_hint = tr_optional(
+                            "llm_provider_tips.ollama.docker_hint",
+                            fallback_language="en",
+                        )
+                    provider_tip_context["docker_hint"] = docker_hint
 
-            st_llm_api_key = llm_api_key
-            if llm_provider_spec.show_api_key:
-                st_llm_api_key = llm_form_panel.text_input(
-                    tr("API Key"),
-                    value=llm_api_key,
-                    type="password",
-                    key=f"{llm_provider}_api_key_input",
-                )
+                tips = get_llm_provider_tips(llm_provider, **provider_tip_context)
+                if tips:
+                    with llm_helper:
+                        st.info(tips)
 
-            st_llm_base_url = llm_base_url
-            if llm_provider_spec.show_base_url:
-                st_llm_base_url = llm_form_panel.text_input(
-                    tr("Base Url"),
-                    value=llm_base_url,
-                    key=(
-                        f"{llm_provider}_base_url_"
-                        f"{selected_service_endpoint.endpoint_id}_input"
-                        if selected_service_endpoint
-                        else f"{llm_provider}_base_url_custom_input"
-                    ),
-                    disabled=selected_service_endpoint is not None,
-                )
-            st_llm_model_name = ""
-            if llm_provider == "groq":
-                effective_api_key = st_llm_api_key or llm_api_key
-                effective_base_url = st_llm_base_url or llm_base_url
-                groq_models = get_groq_model_ids(
-                    api_key=effective_api_key,
-                    base_url=effective_base_url,
-                )
-
-                if groq_models:
-                    selected_index = 0
-                    if llm_model_name in groq_models:
-                        selected_index = groq_models.index(llm_model_name)
-
-                    st_llm_model_name = llm_form_panel.selectbox(
-                        tr("Model Name"),
-                        options=groq_models,
-                        index=selected_index,
-                        key="groq_model_name_select",
+                st_llm_api_key = llm_api_key
+                if llm_provider_spec.show_api_key:
+                    st_llm_api_key = llm_form_panel.text_input(
+                        tr("API Key"),
+                        value=llm_api_key,
+                        type="password",
+                        key=f"{llm_provider}_api_key_input",
                     )
+
+                st_llm_base_url = llm_base_url
+                if llm_provider_spec.show_base_url:
+                    st_llm_base_url = llm_form_panel.text_input(
+                        tr("Base Url"),
+                        value=llm_base_url,
+                        key=(
+                            f"{llm_provider}_base_url_"
+                            f"{selected_service_endpoint.endpoint_id}_input"
+                            if selected_service_endpoint
+                            else f"{llm_provider}_base_url_custom_input"
+                        ),
+                        disabled=selected_service_endpoint is not None,
+                    )
+                st_llm_model_name = ""
+                if llm_provider == "groq":
+                    effective_api_key = st_llm_api_key or llm_api_key
+                    effective_base_url = st_llm_base_url or llm_base_url
+                    groq_models = get_groq_model_ids(
+                        api_key=effective_api_key,
+                        base_url=effective_base_url,
+                    )
+
+                    if groq_models:
+                        selected_index = 0
+                        if llm_model_name in groq_models:
+                            selected_index = groq_models.index(llm_model_name)
+
+                        st_llm_model_name = llm_form_panel.selectbox(
+                            tr("Model Name"),
+                            options=groq_models,
+                            index=selected_index,
+                            key="groq_model_name_select",
+                        )
+                    else:
+                        st_llm_model_name = llm_form_panel.text_input(
+                            tr("Model Name"),
+                            value=llm_model_name,
+                            key="groq_model_name_input",
+                        )
+                        if effective_api_key:
+                            llm_form_panel.caption(tr("Groq Model List Load Failed"))
+                        else:
+                            llm_form_panel.caption(
+                                tr("Groq API Key Required for Model List")
+                            )
                 else:
                     st_llm_model_name = llm_form_panel.text_input(
                         tr("Model Name"),
                         value=llm_model_name,
-                        key="groq_model_name_input",
+                        key=f"{llm_provider}_model_name_input",
                     )
-                    if effective_api_key:
-                        llm_form_panel.caption(tr("Groq Model List Load Failed"))
-                    else:
-                        llm_form_panel.caption(
-                            tr("Groq API Key Required for Model List")
-                        )
-            else:
-                st_llm_model_name = llm_form_panel.text_input(
-                    tr("Model Name"),
-                    value=llm_model_name,
-                    key=f"{llm_provider}_model_name_input",
-                )
-            # 输入框展示 Registry 默认值，但配置只保存真实的用户覆盖值。
-            # 这样默认模型、Base URL 更新后，未自定义的用户能够自动跟随。
-            _set_runtime_config(
-                "app",
-                llm_provider_spec.config_key("api_key"),
-                st_llm_api_key,
-            )
-            _set_runtime_config(
-                "app",
-                llm_provider_spec.config_key("base_url"),
-                normalize_provider_override(
-                    st_llm_base_url,
-                    llm_default_base_url,
-                ),
-            )
-            _set_runtime_config(
-                "app",
-                llm_provider_spec.config_key("model_name"),
-                normalize_provider_override(
-                    st_llm_model_name,
-                    llm_provider_spec.default_model,
-                ),
-            )
-
-            # Provider 专用字段也由 Registry 声明。例如 Cloudflare AI Gateway
-            # 需要 Account ID；以后新增类似字段时无需再在 Main.py 增加判断。
-            for field in llm_provider_spec.extra_fields:
-                field_config_key = llm_provider_spec.config_key(field.config_suffix)
-                field_value = llm_form_panel.text_input(
-                    tr(field.label_key),
-                    value=(config.app.get(field_config_key, "") or field.default_value),
-                    type="password" if field.secret else "default",
-                    key=f"{llm_provider}_{field.config_suffix}_input",
+                # 输入框展示 Registry 默认值，但配置只保存真实的用户覆盖值。
+                # 这样默认模型、Base URL 更新后，未自定义的用户能够自动跟随。
+                _set_runtime_config(
+                    "app",
+                    llm_provider_spec.config_key("api_key"),
+                    st_llm_api_key,
                 )
                 _set_runtime_config(
                     "app",
-                    field_config_key,
+                    llm_provider_spec.config_key("base_url"),
                     normalize_provider_override(
-                        field_value,
-                        field.default_value,
+                        st_llm_base_url,
+                        llm_default_base_url,
+                    ),
+                )
+                _set_runtime_config(
+                    "app",
+                    llm_provider_spec.config_key("model_name"),
+                    normalize_provider_override(
+                        st_llm_model_name,
+                        llm_provider_spec.default_model,
                     ),
                 )
 
-            if llm_form_panel.button(
-                tr("Test LLM Connection"),
-                key="test_llm_connection_button",
-                use_container_width=True,
-                type="secondary",
-                icon=":material/network_check:",
-            ):
-                with config.try_runtime_config_lock() as lock_acquired:
-                    if not lock_acquired:
-                        llm_form_panel.warning(tr("Runtime Configuration Busy"))
-                    else:
-                        with llm_form_panel.spinner(tr("Testing LLM Connection")):
-                            connection_ok, connection_error, connection_elapsed = (
-                                llm.test_connection()
-                            )
+                # Provider 专用字段也由 Registry 声明。例如 Cloudflare AI Gateway
+                # 需要 Account ID；以后新增类似字段时无需再在 Main.py 增加判断。
+                for field in llm_provider_spec.extra_fields:
+                    field_config_key = llm_provider_spec.config_key(field.config_suffix)
+                    field_value = llm_form_panel.text_input(
+                        tr(field.label_key),
+                        value=(config.app.get(field_config_key, "") or field.default_value),
+                        type="password" if field.secret else "default",
+                        key=f"{llm_provider}_{field.config_suffix}_input",
+                    )
+                    _set_runtime_config(
+                        "app",
+                        field_config_key,
+                        normalize_provider_override(
+                            field_value,
+                            field.default_value,
+                        ),
+                    )
 
-                if not lock_acquired:
-                    connection_ok = None
-                elif connection_ok:
-                    llm_form_panel.success(
-                        tr("LLM Connection Test Succeeded").format(
-                            provider=llm_provider_labels[llm_provider],
-                            model=st_llm_model_name or "-",
-                            elapsed=f"{connection_elapsed:.2f}",
+                if llm_form_panel.button(
+                    tr("Test LLM Connection"),
+                    key="test_llm_connection_button",
+                    use_container_width=True,
+                    type="secondary",
+                    icon=":material/network_check:",
+                ):
+                    with config.try_runtime_config_lock() as lock_acquired:
+                        if not lock_acquired:
+                            llm_form_panel.warning(tr("Runtime Configuration Busy"))
+                        else:
+                            with llm_form_panel.spinner(tr("Testing LLM Connection")):
+                                connection_ok, connection_error, connection_elapsed = (
+                                    llm.test_connection()
+                                )
+
+                    if not lock_acquired:
+                        connection_ok = None
+                    elif connection_ok:
+                        llm_form_panel.success(
+                            tr("LLM Connection Test Succeeded").format(
+                                provider=llm_provider_labels[llm_provider],
+                                model=st_llm_model_name or "-",
+                                elapsed=f"{connection_elapsed:.2f}",
+                            )
                         )
-                    )
-                else:
-                    connection_error = format_llm_connection_error(
-                        llm_provider,
-                        st_llm_base_url,
-                        connection_error,
-                    )
-                    llm_form_panel.error(
-                        tr("LLM Connection Test Failed").format(error=connection_error)
-                    )
+                    else:
+                        connection_error = format_llm_connection_error(
+                            llm_provider,
+                            st_llm_base_url,
+                            connection_error,
+                        )
+                        llm_form_panel.error(
+                            tr("LLM Connection Test Failed").format(error=connection_error)
+                        )
 
         # 右侧面板 - API 密钥设置
         with right_config_panel:
@@ -4829,9 +5020,27 @@ def _render_loomloom_script_generation(params):
 
 def _render_script_settings(panel, params):
     """渲染文案设置并更新生成参数。"""
+    # O modo genérico impede os dois botões que chamariam a API de texto.
+    file_cli_mode = bool(config.app.get("file_cli_enabled", False))
     with panel:
         with st.container(border=True):
             st.write(tr("Video Script Settings"))
+            if file_cli_mode:
+                st.caption(tr("Generic AI CLI Edit Help"))
+                saved_field = st.session_state.pop("file_cli_saved_field", None)
+                if saved_field:
+                    st.toast(
+                        tr("Generic AI CLI File Updated").format(
+                            filename=saved_field
+                        )
+                    )
+                field_error = st.session_state.get("file_cli_field_error")
+                if field_error:
+                    st.warning(
+                        tr("Generic AI CLI File Save Failed").format(
+                            error=field_error
+                        )
+                    )
             # 标签行需要容纳“配置大模型”入口，因此无法继续使用 text_area
             # 内置标签。把标签和输入框收进同一个字段容器后，可覆盖内部间距，
             # 同时让该字段与页面上的其它表单控件保持一致的外部节奏。
@@ -4860,6 +5069,8 @@ def _render_script_settings(panel, params):
                     height=96,
                     key="video_subject",
                     label_visibility="collapsed",
+                    on_change=_save_file_cli_field,
+                    args=("tema.txt", "video_subject"),
                 ).strip()
 
             video_languages = [
@@ -4975,19 +5186,22 @@ def _render_script_settings(panel, params):
                         )
 
             # 模型发现只增强视频素材，不改变用户明确选择的文案 Provider。
-            if _effective_script_generation_backend() == "loomloom":
+            if not file_cli_mode and _effective_script_generation_backend() == "loomloom":
                 _render_loomloom_script_generation(params)
-            else:
+            elif not file_cli_mode:
                 _render_local_script_generation(params)
             params.video_script = st.text_area(
                 tr("Video Script"),
                 help=tr("Video Script Help"),
                 height=180,
                 key="video_script",
+                on_change=_save_file_cli_field,
+                args=("roteiro.txt", "video_script"),
             )
-            if _effective_script_generation_backend() == "loomloom":
+            # O segundo botão, de palavras-chave, também não chama a API nesse modo.
+            if not file_cli_mode and _effective_script_generation_backend() == "loomloom":
                 st.caption(tr("LoomLoom Video Terms Reuse Help"))
-            elif st.button(
+            elif not file_cli_mode and st.button(
                 tr("Generate Video Keywords"),
                 key="auto_generate_terms",
                 use_container_width=True,
@@ -5019,7 +5233,13 @@ def _render_script_settings(panel, params):
                 tr("Video Keywords"),
                 help=tr("Video Keywords Help"),
                 key="video_terms",
+                on_change=_save_file_cli_field,
+                args=("palavras_chave.txt", "video_terms"),
             )
+            if file_cli_mode:
+                # O monitor vem depois dos três campos: um rerun disparado por ele
+                # nunca interrompe a página antes de desenhar o roteiro.
+                _render_file_cli_monitor_status()
 
 
 def _render_video_settings(panel, params):
@@ -7435,6 +7655,16 @@ def _render_generation_controls(
     )
     render_onboarding_tour()
     if start_button:
+        if config.app.get("file_cli_enabled", False):
+            # Validação antes da tarefa: evita uma tentativa de usar a API de LLM.
+            if not str(params.video_script or "").strip():
+                st.error(tr("Generic AI CLI Script Required"))
+                st.stop()
+            if params.video_source != "local" and not str(
+                params.video_terms or ""
+            ).strip():
+                st.error(tr("Generic AI CLI Keywords Required"))
+                st.stop()
         _save_runtime_config()
         task_id = st.session_state.get("pending_generation_task_id") or str(uuid4())
         _add_active_generation_task(
@@ -7797,6 +8027,9 @@ def _render_application():
     if restore_applied or restore_succeeded:
         st.success(tr("Task Configuration Loaded"))
 
+    _apply_pending_file_cli_fields()
+    _sync_file_cli_fields_before_widgets()
+
     with st.container(key="main_settings_grid"):
         panel = st.columns(4)
     left_panel = panel[0]
@@ -7805,6 +8038,9 @@ def _render_application():
     right_panel = panel[3]
 
     params = VideoParams(video_subject="")
+    # A tarefa leva o modo escolhido consigo; não depende de mudanças posteriores
+    # no checkbox enquanto está executando em segundo plano.
+    params.file_cli_enabled = bool(config.app.get("file_cli_enabled", False))
     params.match_materials_to_script = bool(
         st.session_state.get("match_materials_to_script", False)
     )

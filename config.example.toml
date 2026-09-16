@@ -238,6 +238,9 @@ sonilo_timeout = 600
 # app/models/llm_provider.py. Leave model_name and base_url empty to follow the
 # Registry defaults; only set them when you need an explicit override.
 llm_provider = "moonshot"
+# Enables the file workspace workflow with an AI CLI chosen by the user.
+# The WebUI creates and monitors the field files in the user's home directory.
+file_cli_enabled = false
 
 # Kimi / Moonshot AI
 # API key: https://platform.kimi.com?track_id=track-2f5441d6ffd84c509dd079d78e9db5dc&aff=moneyprinterturbo

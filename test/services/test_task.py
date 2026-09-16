@@ -90,6 +90,62 @@ class TestTaskService(unittest.TestCase):
             custom_system_prompt="Only write short narration.",
         )
 
+    def test_generic_cli_requires_supplied_script_without_llm_fallback(self):
+        params = VideoParams(
+            video_subject="tema definido",
+            video_script="",
+            file_cli_enabled=True,
+        )
+        state = MemoryState()
+        with (
+            patch.object(tm.llm, "generate_script") as generate,
+            patch.object(tm.sm, "state", state),
+        ):
+            result = tm.generate_script("generic-cli-script", params)
+
+        self.assertIsNone(result)
+        generate.assert_not_called()
+        self.assertEqual(
+            state.get_task("generic-cli-script")["failed_stage"], "script"
+        )
+
+    def test_generic_cli_requires_supplied_keywords_without_llm_fallback(self):
+        params = VideoParams(
+            video_subject="tema definido",
+            video_script="roteiro pronto",
+            video_terms="",
+            file_cli_enabled=True,
+        )
+        state = MemoryState()
+        with (
+            patch.object(tm.llm, "generate_terms") as generate,
+            patch.object(tm.sm, "state", state),
+        ):
+            result = tm.generate_terms(
+                "generic-cli-terms", params, params.video_script
+            )
+
+        self.assertIsNone(result)
+        generate.assert_not_called()
+        self.assertEqual(
+            state.get_task("generic-cli-terms")["failed_stage"], "terms"
+        )
+
+    def test_generic_cli_accepts_keywords_separated_by_lines(self):
+        params = VideoParams(
+            video_subject="tema definido",
+            video_script="roteiro pronto",
+            video_terms="city skyline\ncoffee shop, morning commute",
+            file_cli_enabled=True,
+        )
+        with patch.object(tm.llm, "generate_terms") as generate:
+            result = tm.generate_terms("generic-cli-lines", params, params.video_script)
+
+        self.assertEqual(
+            result, ["city skyline", "coffee shop", "morning commute"]
+        )
+        generate.assert_not_called()
+
     def test_generate_final_videos_forwards_clip_speed_and_fit_mode(self):
         """任务编排层必须把画面速度和适配模式传给视频合成服务。"""
         params = VideoParams(

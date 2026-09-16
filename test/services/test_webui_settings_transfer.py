@@ -175,6 +175,18 @@ def test_settings_preset_round_trip_preserves_generation_settings():
     assert restored["paragraph_number"] == 3
 
 
+def test_settings_preset_round_trip_preserves_generic_cli_mode():
+    params = VideoParams(video_subject="a cat").model_dump(mode="json")
+    payload = build_settings_preset_payload(params, "1", file_cli_enabled=True)
+
+    assert payload["file_cli_enabled"] is True
+    assert parse_settings_preset(_encode(payload))["_file_cli_enabled"] is True
+
+    payload["file_cli_enabled"] = "true"
+    with pytest.raises(ValueError, match="file_cli_enabled"):
+        parse_settings_preset(_encode(payload))
+
+
 def test_settings_preset_round_trip_preserves_builtin_bgm_filename():
     params = VideoParams(
         video_subject="a cat",
