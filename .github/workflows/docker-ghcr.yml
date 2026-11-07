@@ -3,13 +3,10 @@ name: Publish Docker image
 on:
   push:
     branches:
-      - main
-    tags:
-      - "v*"
+      - feature/file-based-ai-cli
     paths-ignore:
       - "README*.md"
       - "docs/**"
-      - ".github/workflows/docker-ghcr.yml"
   workflow_dispatch:
 
 permissions:
@@ -20,18 +17,22 @@ concurrency:
   group: docker-ghcr-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  IMAGE_NAME: ghcr.io/harry0703/moneyprinterturbo
-
 jobs:
   publish:
     name: Build and publish
+    # Publica somente a branch que contém a integração por arquivos.
+    if: github.ref == 'refs/heads/feature/file-based-ai-cli'
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      # GHCR exige o nome em minúsculas e o token pertence a este repositório.
+      - name: Select fork image
+        shell: bash
+        run: echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -52,10 +53,8 @@ jobs:
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch
-            type=ref,event=tag
-            type=semver,pattern={{version}}
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=cli
+            type=sha,prefix=cli-
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
