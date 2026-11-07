@@ -19,8 +19,33 @@ _INTERNAL_UPLOAD_PREFIX = ".bgm-upload-"
 _WINDOWS_INVALID_FILENAME_CHARS = frozenset('<>:"|?*')
 _WINDOWS_RESERVED_FILENAMES = frozenset(
     {"CON", "PRN", "AUX", "NUL"}
-    | {f"COM{index}" for index in range(1, 10)}
-    | {f"LPT{index}" for index in range(1, 10)}
+    | {f"{prefix}{number}" for prefix in ("COM", "LPT") for number in range(1, 10)}
+    # Win32 把 Latin-1 上标数字 ¹、²、³ 也识别为设备编号，因此与普通数字保留名
+    # 同等处理，避免 COM¹.mp3 绕过保护。清单与 webui/Main.py 的下载文件名规则一致。
+    | {f"{prefix}{number}" for prefix in ("COM", "LPT") for number in ("¹", "²", "³")}
+)
+# 文件名会原样进入日志、API 响应和 WebUI 界面，因此除路径分隔符与 Win32 保留名外，
+# 还要拒绝所有控制符和会改变显示形态的字符。此前只拦截 ord < 32（C0 控制符），
+# 漏掉了同一类问题的另一半：
+# * C1 控制符 U+007F-U+009F：U+0085 会被部分日志查看器渲染成换行，一个文件名就能
+#   伪造出额外的、看起来独立的日志行。
+# * 双向文本控制符 U+200E/U+200F/U+202A-U+202E/U+2066-U+2069：U+202E 之后的字符会被
+#   反向渲染，"photo\u202egnp.mp3" 在资源管理器和日志里看起来像另一个扩展名。
+# * U+2028/U+2029（Unicode 行/段分隔符）同样能在一行日志里制造视觉换行。
+# 这些字符都无法在文件名输入框里键入，正常上传不受影响；判定与
+# app/controllers/base.py 的 normalize_task_id 一致（那边直接用 isprintable）。
+_UNSAFE_FILENAME_CHARACTERS = frozenset(
+    chr(code)
+    for code in (
+        *range(0x00, 0x20),
+        *range(0x7F, 0xA0),
+        0x200E,
+        0x200F,
+        0x2028,
+        0x2029,
+        *range(0x202A, 0x202F),
+        *range(0x2066, 0x206A),
+    )
 )
 # MoviePy 最终通过 FFmpeg 解码背景音乐，因此不需要人为限制为 MP3。这里仅开放
 # 主流且语义明确的音频扩展名，避免把 MP4 等带视频容器误当作背景音乐上传。
@@ -94,7 +119,7 @@ def sanitize_upload_filename(filename: str) -> str:
         not safe_name
         or safe_name in {".", ".."}
         or len(safe_name) > 255
-        or any(ord(character) < 32 for character in safe_name)
+        or any(character in _UNSAFE_FILENAME_CHARACTERS for character in safe_name)
         or any(character in _WINDOWS_INVALID_FILENAME_CHARS for character in safe_name)
         or safe_name.lower().startswith(_INTERNAL_UPLOAD_PREFIX)
     ):
@@ -134,10 +159,23 @@ def _validate_audio(file_path: str, timeout_seconds: int = 30) -> None:
                 "-v",
                 "error",
                 "-xerror",
+                # Uploaded files must be self-contained media, not playlists
+                # that cause validation/rendering to read adjacent files or URLs.
+                "-protocol_whitelist",
+                "file,pipe",
+                "-format_whitelist",
+                "mp3,mov,aac,wav,flac,ogg,asf",
                 "-i",
                 file_path,
                 "-map",
                 "0:a:0",
+                # Normalize timestamps from decoded samples. A header-only
+                # WAV can exit successfully without producing any audio.
+                "-af",
+                "asetpts=N/SR/TB",
+                "-progress",
+                "pipe:1",
+                "-nostats",
                 "-f",
                 "null",
                 "-",
@@ -152,6 +190,16 @@ def _validate_audio(file_path: str, timeout_seconds: int = 30) -> None:
         raise BgmServiceError("failed to run FFmpeg for background music validation") from exc
     if decoded.returncode != 0:
         raise BgmUploadError("uploaded file must contain a decodable audio stream")
+    decoded_audio = False
+    for line in decoded.stdout.splitlines():
+        key, separator, value = line.partition(b"=")
+        if separator and key == b"out_time_us":
+            try:
+                decoded_audio = decoded_audio or int(value) > 0
+            except ValueError:
+                continue
+    if not decoded_audio:
+        raise BgmUploadError("uploaded file must contain nonempty decodable audio")
 
 
 def validate_audio_file(file_path: str, timeout_seconds: int = 120) -> None:

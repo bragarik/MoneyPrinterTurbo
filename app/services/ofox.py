@@ -7,7 +7,10 @@ from urllib.parse import quote_plus
 import requests
 from loguru import logger
 
+from app.utils.request_logging import trace_http_call
+
 from app.config import config
+from app.services import generation_progress
 from app.models.schema import MaterialInfo, VideoAspect
 
 
@@ -140,7 +143,9 @@ def _duration_bounds() -> tuple[int, int]:
     def read(key: str, default: int) -> int:
         try:
             value = int(config.app.get(key, default))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # TOML accepts `inf`; int(inf) raises OverflowError, which is not
+            # a provider error and would abort the task with a traceback.
             return default
         return value if value >= 1 else default
 
@@ -224,7 +229,10 @@ def generate_videos(
 
     aspect = VideoAspect(video_aspect)
     video_width, video_height = aspect.to_resolution()
-    requested_duration = max(int(minimum_duration), 1)
+    try:
+        requested_duration = max(int(minimum_duration), 1)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise OFoxError("OFox clip duration must be a positive integer") from exc
     minimum, maximum = _duration_bounds()
     duration = min(max(requested_duration, minimum), maximum)
     if duration != requested_duration:
@@ -257,14 +265,17 @@ def generate_videos(
 
     # 提交接口不做自动重试：超时或 5xx 可能发生在付费任务已经创建之后，
     # 盲目重试会造成重复扣费。只有拿到明确拒绝响应时才判定为确定性失败。
+    generation_progress.submitting('ofox')
     try:
-        response = requests.post(
+        response = trace_http_call(
+            "POST", requests.post,
             videos_url,
             json=payload,
             headers=headers,
             proxies=config.proxy,
             verify=_tls_verify(),
             timeout=(30, 60),
+            allow_redirects=False,
         )
     except Exception as exc:
         raise OFoxUnconfirmedTaskError(
@@ -274,6 +285,11 @@ def generate_videos(
         ) from exc
 
     status_code = _status_code(response)
+    if 300 <= status_code < 400:
+        raise OFoxUnconfirmedTaskError(
+            "OFox submission returned a redirect; the paid task state is "
+            "unknown and the request was not replayed"
+        )
     if status_code >= 500:
         raise OFoxUnconfirmedTaskError(
             f"OFox submission failed with HTTP {status_code}; a paid task may "
@@ -368,6 +384,7 @@ def _wait_for_task(
         0.5,
         60.0,
     )
+    generation_progress.remote('ofox', task_id)
     consecutive_failures = 0
     while True:
         remaining = deadline - time.monotonic()
@@ -383,12 +400,14 @@ def _wait_for_task(
         # 网络库仍可能有极小调度误差，下一处 deadline 检查会阻止再次重试。
         phase_timeout = max(min(remaining / 2.0, 30.0), 0.001)
         try:
-            response = requests.get(
+            response = trace_http_call(
+                "GET", requests.get,
                 f"{videos_url}/{task_id}",
                 headers=headers,
                 proxies=config.proxy,
                 verify=_tls_verify(),
                 timeout=(phase_timeout, phase_timeout),
+                allow_redirects=False,
             )
             status_code = _status_code(response)
             if status_code in RETRYABLE_STATUS_CODES:
@@ -426,6 +445,7 @@ def _wait_for_task(
                     task_id=task_id,
                 ) from exc
             consecutive_failures += 1
+            generation_progress.remote('ofox', task_id, retrying=True)
             if consecutive_failures > MAX_POLL_RETRIES:
                 raise OFoxUnconfirmedTaskError(
                     "OFox polling failed after retries; the paid task may still "
@@ -443,6 +463,7 @@ def _wait_for_task(
 
         consecutive_failures = 0
         status = str(body.get("status") or "").strip().lower()
+        generation_progress.remote('ofox', task_id, status)
         if status in TERMINAL_SUCCESS_STATUSES:
             return body
         if status in TERMINAL_FAILURE_STATUSES:

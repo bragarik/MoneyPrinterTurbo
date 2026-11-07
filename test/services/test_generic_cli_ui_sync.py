@@ -111,3 +111,28 @@ def test_file_changes_fill_and_clear_matching_fields():
         raise AssertionError("deleting a file should update its field")
     ui["_apply_pending_file_cli_fields"]()
     assert streamlit.session_state["video_script"] == ""
+
+
+def test_cli_settings_keep_fields_visible_in_new_settings_dialog(monkeypatch, tmp_path):
+    from unittest.mock import patch
+    from streamlit.testing.v1 import AppTest
+    from app.config import config
+    from app.services import file_cli_workspace
+
+    monitor = FakeMonitor()
+    monkeypatch.setattr(file_cli_workspace, "workspace_path", lambda: tmp_path)
+    monkeypatch.setattr(file_cli_workspace, "ensure_workspace", lambda: tmp_path)
+    monkeypatch.setattr(file_cli_workspace, "get_monitor", lambda: monitor)
+    with (
+        patch.object(config, "app", dict(config.app, file_cli_enabled=True)),
+        patch.object(config, "try_save_config", return_value=True),
+    ):
+        app = AppTest.from_file(str(ROOT / "webui/Main.py"), default_timeout=30)
+        app.session_state["settings_dialog_open"] = True
+        app.session_state["settings_dialog_target_tab"] = "llm"
+        app.run()
+        assert not app.exception
+        assert app.checkbox(key="file_cli_enabled_checkbox_0").value
+        assert app.text_area(key="video_script").value == "Roteiro da IA"
+        assert not any(str(item.key).startswith("llm_provider_select") for item in app.selectbox)
+        assert not any(item.key == "auto_generate_script" for item in app.button)

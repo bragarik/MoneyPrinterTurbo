@@ -8,7 +8,9 @@ rows; it is not a chat-completions provider.
 from __future__ import annotations
 
 import json
+import math
 import os
+import tempfile
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -17,6 +19,9 @@ from urllib.parse import quote, urlsplit
 
 import requests
 from loguru import logger
+
+from app.services import generation_progress
+from app.utils.request_logging import trace_http_call
 
 
 DEFAULT_RESULT_PORT_NAME = "output"
@@ -65,6 +70,25 @@ class LoomLoomRunError(LoomLoomError):
     """Raised when a submitted run fails or exceeds its wait timeout."""
 
 
+def _coerce_seconds_setting(value: Any, name: str) -> float:
+    """
+    把配置里的秒数字段转成浮点数，并保持配置错误的异常类型约定。
+
+    TOML 允许字符串/数组写法，裸 ``float()`` 抛出的 ``ValueError`` /
+    ``TypeError`` 不是 ``LoomLoomError``，会让只捕获 ``LoomLoomError`` 的轮询
+    入口冒泡成 traceback，绕过 ``validate()`` 带配置名的提示；``float(True)``
+    还会静默变成 1.0，把 600 秒等待压成 1 秒。
+    """
+    if isinstance(value, bool):
+        raise LoomLoomConfigurationError(f"{name} must be a number, got {value!r}")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise LoomLoomConfigurationError(
+            f"{name} must be a number, got {value!r}"
+        ) from None
+
+
 def resolve_api_token(values: Mapping[str, Any]) -> str:
     """
     解析当前功能应使用的胜算云 API Key。
@@ -103,20 +127,23 @@ class LoomLoomSettings:
             market_listing_id=DEFAULT_SCRIPT_MARKET_LISTING_ID,
             listing_version_id="",
             result_port_name=DEFAULT_RESULT_PORT_NAME,
-            request_timeout_seconds=float(
+            request_timeout_seconds=_coerce_seconds_setting(
                 values.get(
                     "loomloom_request_timeout_seconds",
                     DEFAULT_REQUEST_TIMEOUT_SECONDS,
-                )
+                ),
+                "loomloom_request_timeout_seconds",
             ),
-            poll_interval_seconds=float(
+            poll_interval_seconds=_coerce_seconds_setting(
                 values.get(
                     "loomloom_poll_interval_seconds",
                     DEFAULT_POLL_INTERVAL_SECONDS,
-                )
+                ),
+                "loomloom_poll_interval_seconds",
             ),
-            run_timeout_seconds=float(
-                values.get("loomloom_run_timeout_seconds", DEFAULT_RUN_TIMEOUT_SECONDS)
+            run_timeout_seconds=_coerce_seconds_setting(
+                values.get("loomloom_run_timeout_seconds", DEFAULT_RUN_TIMEOUT_SECONDS),
+                "loomloom_run_timeout_seconds",
             ),
         )
         settings.validate(require_api_token=True)
@@ -147,6 +174,10 @@ class LoomLoomSettings:
             ("loomloom_poll_interval_seconds", self.poll_interval_seconds),
             ("loomloom_run_timeout_seconds", self.run_timeout_seconds),
         ):
+            # ``value <= 0`` 拦不住 NaN/Inf：NaN 参与比较恒为 False，Inf 永远
+            # 大于当前时间，两者都会让 ``wait_for_run`` 的截止时间失效。
+            if not math.isfinite(value):
+                raise LoomLoomConfigurationError(f"{name} must be a finite number")
             if value <= 0:
                 raise LoomLoomConfigurationError(f"{name} must be greater than zero")
 
@@ -265,11 +296,12 @@ def video_settings_from_mapping(values: Mapping[str, Any]) -> LoomLoomSettings:
         result_port_name=settings.result_port_name,
         request_timeout_seconds=settings.request_timeout_seconds,
         poll_interval_seconds=settings.poll_interval_seconds,
-        run_timeout_seconds=float(
+        run_timeout_seconds=_coerce_seconds_setting(
             values.get(
                 "loomloom_video_run_timeout_seconds",
                 DEFAULT_VIDEO_RUN_TIMEOUT_SECONDS,
-            )
+            ),
+            "loomloom_video_run_timeout_seconds",
         ),
     )
 
@@ -429,12 +461,18 @@ class LoomLoomScriptBackend:
         )
 
     def wait_for_run(self, run_id: str) -> LoomLoomRun:
+        generation_progress.remote("loomloom", run_id)
         deadline = self._clock() + self.settings.run_timeout_seconds
         started_at = self._clock()
         last_logged_status = None
         last_progress_log_at = started_at
         consecutive_poll_errors = 0
         while True:
+            if self._clock() >= deadline:
+                raise LoomLoomRunError(
+                    f"LoomLoom run {run_id} did not complete within "
+                    f"{self.settings.run_timeout_seconds:g} seconds"
+                )
             try:
                 run = self.get_run(run_id)
                 consecutive_poll_errors = 0
@@ -448,6 +486,7 @@ class LoomLoomScriptBackend:
                         f"{self.settings.run_timeout_seconds:g} seconds"
                     ) from exc
                 consecutive_poll_errors += 1
+                generation_progress.remote("loomloom", run_id, retrying=True)
                 retry_delay = min(
                     self.settings.poll_interval_seconds
                     * (2 ** min(consecutive_poll_errors - 1, 4)),
@@ -462,6 +501,7 @@ class LoomLoomScriptBackend:
                 self._sleep(retry_delay)
                 continue
             now = self._clock()
+            generation_progress.remote("loomloom", run_id, run.status)
             progress = run.completed_tasks + run.failed_tasks + run.cancelled_tasks
             # 远端视频任务可能持续数分钟。状态变化时立即记录，状态不变时每
             # 30 秒记录一次心跳，既能帮助定位卡住位置，也避免两秒一次刷屏。
@@ -485,7 +525,7 @@ class LoomLoomScriptBackend:
                     f"LoomLoom run {run.run_id} did not complete within "
                     f"{self.settings.run_timeout_seconds:g} seconds"
                 )
-            self._sleep(self.settings.poll_interval_seconds)
+            self._sleep(min(self.settings.poll_interval_seconds, deadline - now))
 
     def get_script_results(self, run_id: str) -> LoomLoomScriptBatchResult:
         normalized_run_id = self._required_identifier(run_id, "run_id")
@@ -535,6 +575,7 @@ class LoomLoomScriptBackend:
     def _list_all_result_rows(self, run_id: str) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         page_token = ""
+        seen_tokens: set[str] = set()
         while True:
             params: dict[str, Any] = {"pageSize": 200}
             if page_token:
@@ -550,9 +591,12 @@ class LoomLoomScriptBackend:
             ):
                 raise LoomLoomAPIError("LoomLoom resultRows items must be objects")
             rows.extend(items)
-            page_token = str(response.get("nextPageToken", "")).strip()
+            page_token = str(response.get("nextPageToken") or "").strip()
             if not page_token:
                 return rows
+            if page_token in seen_tokens:
+                raise LoomLoomAPIError("LoomLoom returned a repeated resultRows page token")
+            seen_tokens.add(page_token)
 
     def _parse_candidate(
         self, row_index: int, row: Mapping[str, Any]
@@ -589,8 +633,8 @@ class LoomLoomScriptBackend:
         if not isinstance(value, dict):
             raise LoomLoomAPIError("result artifact JSON must be an object")
 
-        script = str(value.get("script", "")).strip()
-        if not script:
+        script = value.get("script")
+        if not isinstance(script, str) or not script.strip():
             raise LoomLoomAPIError("result artifact script is required")
         video_terms = value.get("videoTerms")
         if not isinstance(video_terms, list) or not video_terms:
@@ -598,13 +642,13 @@ class LoomLoomScriptBackend:
                 "result artifact videoTerms must be a non-empty list"
             )
         normalized_terms = tuple(
-            str(term).strip() for term in video_terms if str(term).strip()
+            term.strip() for term in video_terms if isinstance(term, str) and term.strip()
         )
         if not normalized_terms:
             raise LoomLoomAPIError("result artifact videoTerms must not be empty")
         return LoomLoomScriptCandidate(
             row_index=row_index,
-            script=script,
+            script=script.strip(),
             video_terms=normalized_terms,
         )
 
@@ -623,7 +667,8 @@ class LoomLoomScriptBackend:
                 "a LoomLoom credential is required for this request"
             )
         try:
-            response = self._session.request(
+            response = trace_http_call(
+                "REQUEST", self._session.request,
                 method,
                 url,
                 headers={
@@ -633,6 +678,7 @@ class LoomLoomScriptBackend:
                 },
                 json=dict(json_body) if json_body is not None else None,
                 params=dict(params) if params is not None else None,
+                allow_redirects=False,
                 timeout=(5.0, self.settings.request_timeout_seconds),
             )
         except requests.RequestException as exc:
@@ -903,7 +949,8 @@ class LoomLoomVideoBackend(LoomLoomScriptBackend):
         return {**matching[0], "accessUrl": access_url}
 
     def _download_video_artifact(self, access_url: str, destination: str) -> None:
-        temporary = destination + ".part"
+        generation_progress.downloading()
+        temporary = None
         downloaded_bytes = 0
         response = None
         try:
@@ -916,7 +963,11 @@ class LoomLoomVideoBackend(LoomLoomScriptBackend):
             content_length = int(response.headers.get("content-length", 0) or 0)
             if content_length > MAX_VIDEO_ARTIFACT_BYTES:
                 raise LoomLoomAPIError("video artifact exceeds the download limit")
-            with open(temporary, "wb") as output:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", dir=os.path.dirname(destination) or ".",
+                prefix=os.path.basename(destination) + ".", suffix=".part", delete=False,
+            ) as output:
+                temporary = output.name
                 for chunk in response.iter_content(chunk_size=1024 * 1024):
                     if not chunk:
                         continue
@@ -947,5 +998,5 @@ class LoomLoomVideoBackend(LoomLoomScriptBackend):
                         "failed to close LoomLoom video download response: "
                         f"error={type(exc).__name__}"
                     )
-            if os.path.exists(temporary):
+            if temporary is not None and os.path.exists(temporary):
                 os.remove(temporary)
